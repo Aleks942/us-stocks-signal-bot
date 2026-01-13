@@ -5,86 +5,144 @@ import yfinance as yf
 from datetime import datetime, time as dtime
 import pytz
 
-# ========= ENV =========
+# ================= ENV =================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ========= SETTINGS =========
-CHECK_EVERY_SECONDS = 900   # 15m
 MODE = os.getenv("MODE", "SAFE")  # SAFE / AGGRESSIVE
-MAX_SIGNALS_PER_DAY = 6
-COOLDOWN_MINUTES = 90
+MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "6"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "90"))
 
+# ================= SETTINGS =================
+CHECK_EVERY_SECONDS = 900  # 15m
 WARSAW_TZ = pytz.timezone("Europe/Warsaw")
 
 TICKERS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "TSLA",
     "META", "GOOGL", "AMD", "AVGO", "NFLX",
     "INTC", "ORCL", "CRM", "ADBE", "UBER",
-    "SHOP", "PLTR", "COIN", "SNOW", "META"
+    "SHOP", "PLTR", "COIN", "SNOW"
 ]
 
 last_signal_time = {}
 signals_today = 0
 current_day = None
 
-# ========= TELEGRAM =========
+# ================= TELEGRAM =================
 def send(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    requests.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": False
+    })
 
-# ========= TIME FILTER =========
+# ================= TIME FILTER =================
 def is_trading_hours():
     now = datetime.now(WARSAW_TZ).time()
     return dtime(15, 30) <= now <= dtime(22, 0)
 
-# ========= MARKET BIAS =========
+# ================= MARKET BIAS (SAFE) =================
 def market_bias():
-    spy = yf.download("SPY", period="2d", interval="15m", progress=False)
-    qqq = yf.download("QQQ", period="2d", interval="15m", progress=False)
+    try:
+        spy = yf.download("SPY", period="2d", interval="15m", progress=False)
+        qqq = yf.download("QQQ", period="2d", interval="15m", progress=False)
 
-    if spy is None or qqq is None:
+        if spy is None or qqq is None:
+            return "NEUTRAL"
+
+        spy = spy.dropna()
+        qqq = qqq.dropna()
+
+        if len(spy) < 6 or len(qqq) < 6:
+            return "NEUTRAL"
+
+        spy_up = spy["Close"].iloc[-1] > spy["Close"].iloc[-5]
+        qqq_up = qqq["Close"].iloc[-1] > qqq["Close"].iloc[-5]
+
+        if spy_up and qqq_up:
+            return "BULL"
+        if not spy_up and not qqq_up:
+            return "BEAR"
+
+        return "MIXED"
+
+    except Exception as e:
+        print(f"[market_bias] fallback NEUTRAL: {e}")
         return "NEUTRAL"
 
-    spy_up = spy["Close"].iloc[-1] > spy["Close"].iloc[-5]
-    qqq_up = qqq["Close"].iloc[-1] > qqq["Close"].iloc[-5]
+# ================= 60m TREND FILTER (KEY EDGE) =================
+def trend_60m(ticker):
+    try:
+        df = yf.download(ticker, period="7d", interval="60m", progress=False)
+        if df is None:
+            return None
 
-    if spy_up and qqq_up:
-        return "BULL"
-    if not spy_up and not qqq_up:
-        return "BEAR"
-    return "MIXED"
+        df = df.dropna()
+        if len(df) < 10:
+            return None
 
-# ========= STRATEGY =========
-def check_breakout(ticker, bias):
-    df = yf.download(ticker, period="5d", interval="15m", progress=False)
-    if df is None or len(df) < 30:
+        # простой и надёжный тренд
+        return "UP" if df["Close"].iloc[-1] > df["Close"].iloc[-5] else "DOWN"
+
+    except Exception as e:
+        print(f"[trend_60m] {ticker} error: {e}")
         return None
 
-    price = df["Close"].iloc[-1]
-    if price < 5:
+# ================= STRATEGY =================
+def check_breakout(ticker, market_mode):
+    try:
+        df = yf.download(ticker, period="5d", interval="15m", progress=False)
+        if df is None:
+            return None
+
+        df = df.dropna()
+        if len(df) < 30:
+            return None
+
+        price = df["Close"].iloc[-1]
+        if price < 5:
+            return None
+
+        # ----- volume filter -----
+        avg_vol = df["Volume"].iloc[-21:-1].mean()
+        last_vol = df["Volume"].iloc[-1]
+
+        vol_mult = 2.0 if MODE == "SAFE" else 1.3
+        if last_vol < avg_vol * vol_mult:
+            return None
+
+        base = df.iloc[-21:-1]
+        high = base["High"].max()
+        low = base["Low"].min()
+
+        t60 = trend_60m(ticker)
+        if t60 is None:
+            return None
+
+        # ----- LONG -----
+        if price > high:
+            if t60 != "UP":
+                return None
+            if MODE == "SAFE" and market_mode == "BEAR":
+                return None
+            return "LONG", price, high
+
+        # ----- SHORT -----
+        if price < low:
+            if t60 != "DOWN":
+                return None
+            if MODE == "SAFE" and market_mode == "BULL":
+                return None
+            return "SHORT", price, low
+
         return None
 
-    avg_vol = df["Volume"].iloc[-21:-1].mean()
-    last_vol = df["Volume"].iloc[-1]
-
-    vol_mult = 2.0 if MODE == "SAFE" else 1.3
-    if last_vol < avg_vol * vol_mult:
+    except Exception as e:
+        print(f"[check_breakout] {ticker} error: {e}")
         return None
 
-    base = df.iloc[-21:-1]
-    high = base["High"].max()
-    low = base["Low"].min()
-
-    if price > high and bias in ["BULL", "MIXED"]:
-        return "LONG", price, high
-
-    if price < low and bias in ["BEAR", "MIXED"]:
-        return "SHORT", price, low
-
-    return None
-
-# ========= MAIN =========
+# ================= MAIN =================
 def main():
     global signals_today, current_day
 
@@ -92,10 +150,10 @@ def main():
 
     while True:
         now = datetime.now(WARSAW_TZ)
-        day = now.date()
+        today = now.date()
 
-        if day != current_day:
-            current_day = day
+        if today != current_day:
+            current_day = today
             signals_today = 0
 
         if not is_trading_hours():
@@ -106,14 +164,14 @@ def main():
             time.sleep(300)
             continue
 
-        bias = market_bias()
+        mkt = market_bias()
 
         for ticker in TICKERS:
             if ticker in last_signal_time:
                 if time.time() - last_signal_time[ticker] < COOLDOWN_MINUTES * 60:
                     continue
 
-            result = check_breakout(ticker, bias)
+            result = check_breakout(ticker, mkt)
             if not result:
                 continue
 
@@ -126,7 +184,7 @@ def main():
             msg = (
                 f"🇺🇸 {ticker} | 15m INTRADAY\n"
                 f"Режим: {MODE}\n"
-                f"Рынок: {bias}\n\n"
+                f"Рынок: {mkt}\n\n"
                 f"СИГНАЛ: {side}\n"
                 f"Цена: {price:.2f}\n"
                 f"Уровень: {level:.2f}\n\n"
@@ -134,7 +192,7 @@ def main():
                 f"• Вход: рынок / ретест\n"
                 f"• Стоп: за уровень\n"
                 f"• Цель: 1.5–2R\n\n"
-                f"📊 {tv}"
+                f"📊 TradingView:\n{tv}"
             )
 
             send(msg)
