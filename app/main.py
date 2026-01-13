@@ -18,7 +18,10 @@ CHECK_EVERY_SECONDS = 900
 CACHE_TTL = 20 * 60
 WARSAW_TZ = pytz.timezone("Europe/Warsaw")
 
-TOP_N = 3  # ТОП-3 СЕТАПА В ДЕНЬ
+TOP_N = 3
+
+OPENING_START = dtime(15, 30)
+OPENING_END   = dtime(17, 0)
 
 TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","TSLA","META","GOOGL","AMD",
@@ -27,23 +30,30 @@ TICKERS = [
 ]
 
 # ================= STATE =================
-price_cache = {}     # ticker -> (ts, df15, df60)
-market_cache = {}    # SPY/QQQ -> (ts, df)
+price_cache = {}
+market_cache = {}
 last_signal_time = {}
 signals_today = 0
 current_day = None
+
+earnings_block = set()
+earnings_last_update = 0
 
 # ================= TELEGRAM =================
 def send(text):
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False}
+        json={"chat_id": CHAT_ID, "text": text}
     )
 
 # ================= TIME =================
 def is_trading_hours():
     now = datetime.now(WARSAW_TZ).time()
     return dtime(15, 30) <= now <= dtime(22, 0)
+
+def is_opening_range():
+    now = datetime.now(WARSAW_TZ).time()
+    return OPENING_START <= now <= OPENING_END
 
 # ================= SAFE DOWNLOAD =================
 def safe_download(ticker, period, interval):
@@ -54,6 +64,29 @@ def safe_download(ticker, period, interval):
         return df.dropna()
     except Exception:
         return None
+
+# ================= EARNINGS GUARD =================
+def update_earnings_block():
+    global earnings_block, earnings_last_update
+    if time.time() - earnings_last_update < 24*3600:
+        return
+
+    try:
+        url = "https://api.nasdaq.com/api/calendar/earnings"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+
+        symbols = set()
+        for row in data["data"]["rows"]:
+            symbols.add(row["symbol"])
+
+        earnings_block = symbols
+        earnings_last_update = time.time()
+        print(f"[earnings] blocked {len(symbols)} tickers")
+
+    except Exception as e:
+        print("[earnings] failed, skipping:", e)
 
 # ================= MARKET BIAS =================
 def market_bias():
@@ -91,31 +124,30 @@ def trend_60m(ticker):
     return "UP" if df60["Close"].iloc[-1] > df60["Close"].iloc[-5] else "DOWN"
 
 # ================= SCORE =================
-def calc_score(df15, price, level, side):
+def calc_score(df15, price, level):
     score = 0
-
-    # RVOL (0–40)
     avg_vol = df15["Volume"].iloc[-21:-1].mean()
     last_vol = df15["Volume"].iloc[-1]
     rvol = last_vol / avg_vol if avg_vol > 0 else 0
     score += min(40, int(rvol * 15))
 
-    # SQUEEZE (0–20)
     rng = (df15["High"].iloc[-21:-1].max() - df15["Low"].iloc[-21:-1].min()) / price
     if rng < 0.02: score += 20
     elif rng < 0.03: score += 10
 
-    # BREAKOUT STRENGTH (0–20)
     dist = abs(price - level) / price
     score += min(20, int(dist * 500))
 
-    # DIRECTION BONUS (0–20)
-    score += 20
+    if is_opening_range():
+        score += 20
 
     return min(100, score)
 
 # ================= STRATEGY =================
 def scan_ticker(ticker, market_mode):
+    if ticker in earnings_block:
+        return None
+
     now = time.time()
     ts, df15, df60 = price_cache.get(ticker,(0,None,None))
 
@@ -137,13 +169,17 @@ def scan_ticker(ticker, market_mode):
     t60 = trend_60m(ticker)
     if not t60: return None
 
+    min_score = 55 if is_opening_range() else 60
+
     if price > high and t60=="UP" and (MODE!="SAFE" or market_mode!="BEAR"):
-        score = calc_score(df15, price, high, "LONG")
-        return {"ticker":ticker,"side":"LONG","price":price,"level":high,"score":score}
+        score = calc_score(df15, price, high)
+        if score >= min_score:
+            return {"ticker":ticker,"side":"LONG","price":price,"level":high,"score":score}
 
     if price < low and t60=="DOWN" and (MODE!="SAFE" or market_mode!="BULL"):
-        score = calc_score(df15, price, low, "SHORT")
-        return {"ticker":ticker,"side":"SHORT","price":price,"level":low,"score":score}
+        score = calc_score(df15, price, low)
+        if score >= min_score:
+            return {"ticker":ticker,"side":"SHORT","price":price,"level":low,"score":score}
 
     return None
 
@@ -155,9 +191,9 @@ def main():
 
     while True:
         try:
-            now_dt = datetime.now(WARSAW_TZ)
-            today = now_dt.date()
+            update_earnings_block()
 
+            today = datetime.now(WARSAW_TZ).date()
             if today != current_day:
                 current_day = today
                 signals_today = 0
@@ -177,7 +213,7 @@ def main():
                 if t in last_signal_time and time.time()-last_signal_time[t] < COOLDOWN_MINUTES*60:
                     continue
                 res = scan_ticker(t, mkt)
-                if res and res["score"] >= 60:
+                if res:
                     candidates.append(res)
 
             candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)[:TOP_N]
@@ -186,14 +222,15 @@ def main():
                 last_signal_time[c["ticker"]] = time.time()
                 signals_today += 1
 
+                tag = "OPENING RANGE" if is_opening_range() else "INTRADAY"
+
                 send(
-                    f"🇺🇸 {c['ticker']} | 15m INTRADAY\n"
+                    f"🇺🇸 {c['ticker']} | 15m {tag}\n"
                     f"Режим: {MODE}\n"
                     f"Score: {c['score']} / 100 ⭐\n\n"
                     f"СИГНАЛ: {c['side']}\n"
                     f"Цена: {c['price']:.2f}\n"
-                    f"Уровень: {c['level']:.2f}\n\n"
-                    f"📊 https://www.tradingview.com/chart/?symbol=NASDAQ:{c['ticker']}"
+                    f"Уровень: {c['level']:.2f}"
                 )
 
             time.sleep(CHECK_EVERY_SECONDS)
@@ -204,3 +241,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
